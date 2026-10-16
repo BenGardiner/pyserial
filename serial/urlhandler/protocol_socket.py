@@ -18,16 +18,36 @@
 
 from __future__ import absolute_import
 
-import ctypes
 import errno
 import logging
 import select
 import socket
+import sys
 import time
 try:
     import urlparse
 except ImportError:
     import urllib.parse as urlparse
+
+if sys.platform == 'win32':
+    import ctypes
+    _SOCKET = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint32
+    _ioctlsocket = ctypes.windll.ws2_32.ioctlsocket
+    _ioctlsocket.argtypes = [_SOCKET, ctypes.c_long, ctypes.POINTER(ctypes.c_ulong)]
+    _ioctlsocket.restype = ctypes.c_int
+else:
+    try:
+        import fcntl
+        import struct
+        import termios
+
+        if hasattr(termios, 'TIOCINQ'):
+            TIOCINQ = termios.TIOCINQ
+        else:
+            TIOCINQ = getattr(termios, 'FIONREAD', 0x541B)
+        TIOCM_zero_str = struct.pack('I', 0)
+    except ImportError:
+        fcntl = None
 
 from serial.serialutil import SerialBase, SerialException, to_bytes, \
     PortNotOpenError, SerialTimeoutException, Timeout
@@ -138,25 +158,19 @@ class Serial(SerialBase):
         if not self.is_open:
             raise PortNotOpenError()
 
-        if sys.platform in ('linux', 'darwin'):
-            # Linux, Mac OS X
-            pending = ctypes.c_int()
-            libc = ctypes.CDLL(None)
-            libc.ioctl(
-                self._socket.fileno(),
-                0x541B,
-                ctypes.byref(pending)
-            )
-            return pending.value
-        elif sys.platform == 'win32':
+        if sys.platform == 'win32':
             # Windows
             pending = ctypes.c_ulong()
-            ctypes.windll.ws2_32.ioctlsocket(
-                sock.fileno(),
+            if _ioctlsocket(
+                self._socket.fileno(),
                 0x4004667F,  # FIONREAD
                 ctypes.byref(pending)
-            )
+            ) != 0:
+                raise OSError(ctypes.WinError())
             return pending.value
+        elif fcntl is not None:
+            s = fcntl.ioctl(self._socket.fileno(), TIOCINQ, TIOCM_zero_str)
+            return struct.unpack('I', s)[0]
         else:
             # Other platforms are not supported
             raise NotImplementedError('platform not supported')
